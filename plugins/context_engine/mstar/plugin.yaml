@@ -1,0 +1,3 @@
+name: mstar
+description: "MSTAR Pro v3.0 Fitness-Aware Context Engine. Wraps ContextCompressor with fitness-based prioritization during context compression. Requires memory.provider: mstar in config.yaml."
+version: 3.0.0

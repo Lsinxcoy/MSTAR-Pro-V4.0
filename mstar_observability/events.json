@@ -1,0 +1,25 @@
+[
+  {
+    "event_id": "evo_test_evo_final_1",
+    "event_type": "random_change",
+    "program_id": "failing_tool",
+    "timestamp": "2026-05-16T04:32:01.049915",
+    "data": {
+      "fitness_before": 0.0520144561562527,
+      "fitness_after": 0.0520144561562527,
+      "fitness_delta": 0.0,
+      "reason": "Random exploration",
+      "decision_explanation": "极低适应度 (0.052) | 变异类型: random_change",
+      "details": {
+        "success": true,
+        "mutation_type": "random_change",
+        "new_fitness": 0.0520144561562527,
+        "reason": "Random exploration",
+        "details": null,
+        "fitness_before": 0.0520144561562527,
+        "fitness_after": 0.0520144561562527,
+        "fitness_delta": 0.0
+      }
+    }
+  }
+]
