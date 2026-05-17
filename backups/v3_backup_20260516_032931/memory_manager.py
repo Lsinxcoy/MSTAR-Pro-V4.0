@@ -207,15 +207,11 @@ class MemoryManager:
         Built-in provider (name ``"builtin"``) is always accepted.
         Only **one** external (non-builtin) provider is allowed — a second
         attempt is rejected with a warning.
-        
-        MSTAR Pro v4.0: if provider is "mstar", it is always inserted
-        as the primary provider (index 0) for Fitness-first routing.
         """
         is_builtin = provider.name == "builtin"
-        is_mstar = provider.name == "mstar"
 
         if not is_builtin:
-            if self._has_external and not is_mstar:
+            if self._has_external:
                 existing = next(
                     (p.name for p in self._providers if p.name != "builtin"), "unknown"
                 )
@@ -229,11 +225,7 @@ class MemoryManager:
                 return
             self._has_external = True
 
-        # MSTAR Pro v4.0: always insert as primary provider
-        if is_mstar:
-            self._providers.insert(0, provider)
-        else:
-            self._providers.append(provider)
+        self._providers.append(provider)
 
         # Index tool names → provider for routing
         for schema in provider.get_tool_schemas():

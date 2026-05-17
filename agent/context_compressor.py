@@ -371,7 +371,28 @@ class ContextCompressor(ContextEngine):
         self._last_aux_model_failure_model = None
         self._last_compression_savings_pct = 100.0
         self._ineffective_compression_count = 0
+        self._summary_failure_cooldown_until = 0.0
+        # MSTAR Pro v4.0: reset batch eviction counters
+        self._batch_evict_counter = 0
+        self._batch_evicted_count = 0
+
+    def set_mstar_core(self, mstar_core):
+        """Inject MSTARCore reference for compression metadata notifications."""
+        self._mstar_core = mstar_core
+        self._context_probe_persistable = False
+        self._previous_summary = None
+        self._last_summary_error = None
+        self._last_summary_dropped_count = 0
+        self._last_summary_fallback_used = False
+        self._last_aux_model_failure_error = None
+        self._last_aux_model_failure_model = None
+        self._last_compression_savings_pct = 100.0
+        self._ineffective_compression_count = 0
         self._summary_failure_cooldown_until = 0.0  # transient errors must not block a fresh session
+
+        # MSTAR Pro v4.0: reset batch eviction counters
+        self._batch_evict_counter = 0
+        self._batch_evicted_count = 0
 
     def update_model(
         self,
@@ -381,6 +402,10 @@ class ContextCompressor(ContextEngine):
         api_key: str = "",
         provider: str = "",
         api_mode: str = "",
+        threshold_percent: float = None,
+        protect_first_n: int = None,
+        protect_last_n: int = None,
+        summary_target_ratio: float = None,
     ) -> None:
         """Update model info after a model switch or fallback activation."""
         self.model = model
@@ -389,12 +414,22 @@ class ContextCompressor(ContextEngine):
         self.provider = provider
         self.api_mode = api_mode
         self.context_length = context_length
+        # Accept optional compression params from callers that forward them
+        # (e.g. MSTARContextEngine.update_model), but only override if explicitly set.
+        if threshold_percent is not None:
+            self.threshold_percent = threshold_percent
+        if protect_first_n is not None:
+            self.protect_first_n = protect_first_n
+        if protect_last_n is not None:
+            self.protect_last_n = protect_last_n
+        if summary_target_ratio is not None:
+            self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.threshold_tokens = max(
             int(context_length * self.threshold_percent),
             MINIMUM_CONTEXT_LENGTH,
         )
         # Recalculate token budgets for the new context length so the
-        # compressor stays calibrated after a model switch (e.g. 200K → 32K).
+        # compressor stays calibrated after a model switch (e.g. 200K -> 32K).
         target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
         self.tail_token_budget = target_tokens
         self.max_summary_tokens = min(
@@ -426,6 +461,14 @@ class ContextCompressor(ContextEngine):
         self.protect_last_n = protect_last_n
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
+
+        # ------------------------------------------------------------------
+        # MSTAR Pro v4.0: Cache-aware batch eviction
+        # Inspired by Anthropic Computer Use 3-layer context filtering
+        # ------------------------------------------------------------------
+        self.evict_interval: int = 25
+        self._batch_evict_counter: int = 0
+        self._batch_evicted_count: int = 0
 
         self.context_length = get_model_context_length(
             model, base_url=base_url, api_key=api_key,
@@ -592,7 +635,38 @@ class ContextCompressor(ContextEngine):
             protected_count = max(budget_protect_count, min_protect)
             prune_boundary = len(result) - protected_count
         else:
-            prune_boundary = len(result) - protect_tail_count
+            # MSTAR Pro v4.0: Cache-aware batch eviction
+            #
+            # Without batching: every new message would evict 1 old message,
+            # changing the prefix on EVERY turn and destroying prompt cache.
+            #
+            # With batch eviction: we accumulate messages beyond protect_tail_count
+            # and only evict evict_interval old messages in ONE pass when the
+            # counter hits the threshold. The message prefix stays byte-identical
+            # for evict_interval turns between pruning events.
+            #
+            # protect_tail_count is always protected as a hard floor.
+            base_boundary = len(result) - protect_tail_count
+            messages_beyond_floor = base_boundary
+
+            if messages_beyond_floor <= self.evict_interval:
+                # Not enough messages to trigger batch eviction yet.
+                # Stay fully protected — no pruning.
+                prune_boundary = base_boundary
+            else:
+                # Count this pruning pass toward the next batch eviction.
+                self._batch_evict_counter += 1
+
+                if self._batch_evict_counter < self.evict_interval:
+                    # Not yet time to evict — protect everything this turn
+                    prune_boundary = base_boundary
+                else:
+                    # Time to batch-evict: remove evict_interval old messages
+                    # from the HEAD. Tail (last_n) boundary doesn't move.
+                    evict_count = min(self.evict_interval, base_boundary)
+                    prune_boundary = base_boundary - evict_count
+                    self._batch_evicted_count += evict_count
+                    self._batch_evict_counter = 0  # reset for next cycle
 
         # Pass 1: Deduplicate identical tool results.
         # When the same file is read multiple times, keep only the most recent
@@ -1546,6 +1620,36 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 )
                 _merge_summary_into_tail = False
             compressed.append(msg)
+
+        # MSTAR Pro v4.0 P1-2: notify ForgettingMechanism of compression metadata
+        # This allows forgetting decisions to account for information density
+        # (low compression_ratio = high-value preserved content = protect longer)
+        if hasattr(self, '_mstar_core') and self._mstar_core is not None:
+            try:
+                mc = self._mstar_core
+                session_id = getattr(self, '_session_id', None) or f"session_{id(self)}"
+                original_count = n_messages
+                compressed_count = len(compressed)
+                compression_ratio = compressed_count / original_count if original_count > 0 else 1.0
+                avg_quality = self._last_compression_savings_pct / 100.0
+                mc.record_batch_session(
+                    session_id=session_id,
+                    message_count=original_count,
+                    quality_scores=[avg_quality] * compressed_count,
+                    total_tokens=int(display_tokens) if display_tokens else 0,
+                    duration=getattr(self, '_last_compression_duration', 0.0),
+                )
+                mc.forgetting_mechanism.record_session_metadata(
+                    session_id=session_id,
+                    message_count=original_count,
+                    compressed_to_turns=compressed_count,
+                    compression_ratio=compression_ratio,
+                    avg_quality=avg_quality,
+                    total_tokens=int(display_tokens) if display_tokens else 0,
+                    duration=getattr(self, '_last_compression_duration', 0.0),
+                )
+            except Exception:
+                pass  # non-critical notification, must not break compression
 
         self.compression_count += 1
 

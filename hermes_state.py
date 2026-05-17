@@ -1094,6 +1094,11 @@ class SessionDB:
         Strips any existing " #N" suffix to find the base name, then finds
         the highest existing number and increments.
         """
+        # Defensive: handle None or non-string input
+        if not base_title or not isinstance(base_title, str):
+            import time
+            return f"Session_{int(time.time()) % 10000}"
+
         # Strip existing #N suffix to find the true base
         match = re.match(r'^(.*?) #(\d+)$', base_title)
         if match:

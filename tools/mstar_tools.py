@@ -73,6 +73,21 @@ def mstar(action: str = "", program_id: str = "", detailed: bool = False,
                 session_id=f"manual_{datetime.now().timestamp()}",
                 stats={}
             )
+            # Bug-3 fix: convert MemoryProgram objects to serializable dicts
+            if result.get('triggered') and 'program_id' not in result:
+                result['program_id'] = result.get('program', {}).get('program_id') if isinstance(result.get('program'), dict) else str(result.get('program'))
+            if 'program' in result:
+                prog = result.pop('program')
+                if hasattr(prog, 'program_id'):
+                    result['program_id'] = prog.program_id
+                    result['program_name'] = getattr(prog, 'name', '')
+                    result['fitness_before'] = getattr(prog, 'fitness_score', None)
+            if 'events' in result:
+                for ev in result['events']:
+                    if 'program' in ev:
+                        prog = ev.pop('program')
+                        if hasattr(prog, 'program_id'):
+                            ev['program_id'] = prog.program_id
             return json.dumps({
                 "success": True,
                 "action": "trigger_evolution",

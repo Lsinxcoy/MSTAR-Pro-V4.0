@@ -179,16 +179,11 @@ class EvolutionEngine:
                     logger.warning(f"[MSTAR] SelfImprovingBridge notification failed: {e}")
 
             # ── Step 7: 反馈记录（用于 TrainedPredictor 后续训练）──
+            # Bug-2 fix: predictor.record_outcome() 内部已调用 fitness_tracker.record_evolution_outcome()
+            # 删掉 engine 侧多余的第二份写入，避免 evolution_outcomes 重复行
             if hasattr(self.predictor, 'record_outcome'):
                 delta = mutation_result.get('fitness_delta', 0)
                 self.predictor.record_outcome(
-                    program_id=target.program_id,
-                    strategy=strategy,
-                    predicted_prob=prob,
-                    actual_delta=delta,
-                )
-                # P2: 同时写入 evolution_outcomes（predictor 内部也会写，这里补写确保覆盖）
-                self.fitness_tracker.record_evolution_outcome(
                     program_id=target.program_id,
                     strategy=strategy,
                     predicted_prob=prob,
@@ -253,6 +248,14 @@ class EvolutionEngine:
         failure_analysis = self.reflector.analyze_failures(program)
         strategy = strategy or failure_analysis.get('recommended_strategy', 'random')
 
+        # 记录变异前状态（Bug-4: 用于 rollback 熔断）
+        import copy
+        state_before = {
+            'fitness_score': program.fitness_score,
+            'lineage_depth': getattr(program, 'lineage_depth', 0),
+            'parent_id': getattr(program, 'parent_id', None),
+        }
+
         mutation_result = self.mutator.mutate(program, strategy=strategy)
 
         # 记录变异前fitness（用于Dashboard快照和反馈记录）
@@ -266,18 +269,41 @@ class EvolutionEngine:
             #   如果程序是从 DB 加载的，parent_id 可能为 None；设为自身 ID 表示"无祖先"
             if getattr(program, 'parent_id', None) is None:
                 program.parent_id = program.program_id
+
+            # ── Bug-4: 熔断机制 - 预测概率 > 0.5 但 fitness 反而下降则 rollback ──
+            predicted_prob = mutation_result.__dict__.get('predicted_prob', 0.5)
+            fitness_after = mutation_result.new_fitness
+            fitness_delta = fitness_after - fitness_before
+
+            if predicted_prob > 0.5 and fitness_delta < 0:
+                logger.warning(
+                    f"[Bug-4 Rollback] prog={program.program_id} "
+                    f"predicted={predicted_prob:.3f} actual_delta={fitness_delta:.4f} → REVERTING"
+                )
+                # 回滚到变异前状态
+                program.fitness_score = state_before['fitness_score']
+                program.lineage_depth = state_before['lineage_depth']
+                program.parent_id = state_before['parent_id']
+                mutation_result = copy.deepcopy(mutation_result)
+                mutation_result.success = False
+                mutation_result.reason = f"[Rollback] predicted={predicted_prob:.3f} but fitness dropped {fitness_delta:.4f}"
+                mutation_result.new_fitness = None
+                fitness_after = fitness_before
+                fitness_delta = 0.0
+
             # 保存更新后的 lineage_depth 到 DB
             if hasattr(self.fitness_tracker, '_save_program'):
                 self.fitness_tracker._save_program(program)
-
-        fitness_after = mutation_result.new_fitness if mutation_result.new_fitness is not None else fitness_before
-        fitness_delta = fitness_after - fitness_before
+        else:
+            fitness_after = mutation_result.new_fitness if mutation_result.new_fitness is not None else fitness_before
+            fitness_delta = fitness_after - fitness_before
 
         return {
             **mutation_result.__dict__,
             'fitness_before': fitness_before,
             'fitness_after': fitness_after,
             'fitness_delta': fitness_delta,
+            'rollback': fitness_delta == 0 and mutation_result.__dict__.get('predicted_prob', 0) > 0.5,
         }
 
     def _explain_evolution_decision(self, program, result: Dict, predicted_prob: float = None) -> str:

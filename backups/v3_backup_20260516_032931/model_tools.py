@@ -723,12 +723,6 @@ def handle_function_call(
     # Coerce string arguments to their schema-declared types (e.g. "42"→42)
     function_args = coerce_tool_args(function_name, function_args)
 
-    # === MSTAR Pro v4.0: Pre-dispatch hook ===
-    # NOTE: MSTARCore.pre_tool_dispatch was removed in v3.0.
-    # Fitness-aware routing is handled via SelfImprovingBridge in the agent loop.
-    # Kept as placeholder for future per-tool fitness hooks.
-    pass
-
     try:
         if function_name in _AGENT_LOOP_TOOLS:
             return json.dumps({"error": f"{function_name} must be handled by the agent loop"})

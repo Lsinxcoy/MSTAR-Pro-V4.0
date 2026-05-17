@@ -238,7 +238,41 @@ class RuleBasedPredictor(ToolFitnessPredictor):
                     score -= 0.10
 
         # ── 规则5: 策略固有加成 ─────────────────────────────
-        score += self.STRATEGY_BONUS.get(strategy, 0.0)
+        # Bug-5 fix: 用真实历史数据替代硬编码 STRATEGY_BONUS
+        # Bayesian smoothing: 综合先验（STRATEGY_BONUS_BASE）和观测数据
+        success_rate = self.get_strategy_success_rate(strategy)
+        avg_delta = self.get_strategy_avg_delta(strategy)
+
+        STRATEGY_BONUS_BASE = {
+            'combo_crossover':       0.10,
+            'combo_ensemble':        0.10,
+            'instruction_examples':  0.06,
+            'instruction_context':   0.05,
+            'logic_query_add':       0.05,
+            'instruction_guidance':  0.04,
+            'schema_field_add':      0.03,
+            'schema_field_modify':   0.02,
+            'instruction_threshold':0.02,
+            'logic_read_modify':     0.01,
+            'instruction_priority':  0.00,
+            'instruction_keyword':   0.00,
+            'instruction_format':    0.00,
+            'schema_field_remove':  -0.01,
+            'logic_write_modify':   -0.02,
+            'random_change':        -0.08,
+        }
+        prior = STRATEGY_BONUS_BASE.get(strategy, 0.0)
+
+        # 从历史数据计算学习型加成
+        history_bonus = (success_rate - 0.5) * 0.20  # 成功率偏离0.5的比例 * 系数
+        delta_bonus = avg_delta * 0.30                 # 平均 delta 的权重
+
+        # Bayesian blend: 数据少时偏先验，数据多时偏观测
+        n = len([e for e in self._strategy_history if e['strategy'] == strategy])
+        alpha = min(n / 10.0, 1.0)  # 10条以上数据基本只看观测
+        dynamic_bonus = (1 - alpha) * prior + alpha * (history_bonus + delta_bonus)
+
+        score += dynamic_bonus
 
         # ── 规则6: 探索噪声（给"探索精神"留空间）──────────
         score += random.uniform(-0.03, 0.03)

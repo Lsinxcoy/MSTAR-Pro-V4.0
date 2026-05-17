@@ -1991,40 +1991,9 @@ class AIAgent:
         # Memory provider plugin (external — one at a time, alongside built-in)
         # Reads memory.provider from config to select which plugin to activate.
         self._memory_manager = None
-        self._mstar_enabled = False
-        self._mstar_core = None
-        self._self_improver = None
         if not skip_memory:
             try:
                 _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
-
-                # === MSTAR Pro v4.0 初始化 ===
-                if _mem_provider_name == "mstar":
-                    try:
-                        from mstar_core import MSTARCore, SelfImprovingBridge
-                        _mstar_cfg = _agent_cfg.get("mstar", {})
-                        self._mstar_core = MSTARCore(
-                            hermes_home=str(get_hermes_home()),
-                            mode=_mstar_cfg.get("mode", "balanced"),
-                            fitness_dimensions=_mstar_cfg.get("fitness_dimensions", 20),
-                        )
-                        self._self_improver = SelfImprovingBridge(self._mstar_core)
-                        logger.info("[MSTAR] v3.0 Core initialized (mode=%s, dims=%d)",
-                                    _mstar_cfg.get("mode", "balanced"),
-                                    _mstar_cfg.get("fitness_dimensions", 20))
-                        # Inject MSTARCore reference into MSTARContextEngine if active
-                        if hasattr(self, 'context_compressor') and self.context_compressor:
-                            _cc = self.context_compressor
-                            if hasattr(_cc, 'set_mstar_core'):
-                                _cc.set_mstar_core(self._mstar_core)
-                                logger.info("[MSTAR] ContextEngine: MSTARCore injected")
-                            elif hasattr(_cc, '_inner') and hasattr(_cc._inner, 'set_mstar_core'):
-                                _cc.set_mstar_core(self._mstar_core)
-                                logger.info("[MSTAR] ContextEngine (wrapped): MSTARCore injected")
-                    except ImportError as _e:
-                        logger.warning("[MSTAR] Core import failed: %s", _e)
-                    except Exception as _e:
-                        logger.warning("[MSTAR] Core init failed: %s", _e)
 
                 if _mem_provider_name:
                     from agent.memory_manager import MemoryManager as _MemoryManager
@@ -2335,25 +2304,7 @@ class AIAgent:
         # else: config says "compressor" — use built-in, don't auto-activate plugins
 
         if _selected_engine is not None:
-            # For the mstar fitness-aware wrapper, wire up a real ContextCompressor as inner
-            if hasattr(_selected_engine, 'set_inner') and _selected_engine.name == "mstar":
-                _inner_compressor = ContextCompressor(
-                    model=self.model,
-                    threshold_percent=compression_threshold,
-                    protect_first_n=compression_protect_first,
-                    protect_last_n=compression_protect_last,
-                    summary_target_ratio=compression_target_ratio,
-                    summary_model_override=None,
-                    quiet_mode=self.quiet_mode,
-                    base_url=self.base_url,
-                    api_key=getattr(self, "api_key", ""),
-                    config_context_length=_config_context_length,
-                    provider=self.provider,
-                    api_mode=self.api_mode,
-                )
-                _selected_engine.set_inner(_inner_compressor)
-                logger.info("[MSTAR] ContextEngine: ContextCompressor wired as inner")
-
+            self.context_compressor = _selected_engine
             # Resolve context_length for plugin engines — mirrors switch_model() path
             from agent.model_metadata import get_model_context_length
             _plugin_ctx_len = get_model_context_length(
@@ -2364,17 +2315,12 @@ class AIAgent:
                 provider=self.provider,
                 custom_providers=_custom_providers,
             )
-            self.context_compressor = _selected_engine
             self.context_compressor.update_model(
                 model=self.model,
                 context_length=_plugin_ctx_len,
                 base_url=self.base_url,
                 api_key=getattr(self, "api_key", ""),
                 provider=self.provider,
-                threshold_percent=compression_threshold,
-                protect_first_n=compression_protect_first,
-                protect_last_n=compression_protect_last,
-                summary_target_ratio=compression_target_ratio,
             )
             if not self.quiet_mode:
                 logger.info("Using context engine: %s", _selected_engine.name)
@@ -5751,13 +5697,6 @@ class AIAgent:
                 )
             except Exception:
                 pass
-
-        # === MSTAR Pro v4.0: Session-end evolution trigger ===
-        if self._mstar_core:
-            try:
-                self._mstar_core.on_session_end(messages or [], self.session_id or "")
-            except Exception:
-                logger.debug("[MSTAR] on_session_end error: %s", _e)
 
     def _sync_external_memory_for_turn(
         self,
@@ -10512,8 +10451,8 @@ class AIAgent:
                 self._session_db.update_system_prompt(self.session_id, new_system_prompt)
                 # Reset flush cursor — new session starts with no messages written
                 self._last_flushed_db_idx = 0
-            except Exception as _e:
-                logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", _e)
+            except Exception as e:
+                logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
 
         # Notify the context engine that the session_id rotated because of
         # compression (not a fresh /new). Plugin engines (e.g. hermes-lcm) use
@@ -11512,49 +11451,6 @@ class AIAgent:
             # Log tool errors to the persistent error log so [error] tags
             # in the UI always have a corresponding detailed entry on disk.
             _is_error_result, _ = _detect_tool_failure(function_name, function_result)
-
-            # === MSTAR Pro v4.0: Tool Call后Fitness更新 ===
-            # (inserted after _is_error_result is computed, before guardrails)
-            if self._mstar_core:
-                _mstar_tool_eval = {
-                    'success': not _is_error_result,
-                    'tool_name': function_name,
-                    'result_length': _result_len,
-                    'has_error': _is_error_result,
-                    'timestamp': time.time(),
-                }
-                try:
-                    self._mstar_core.record_tool_execution(
-                        tool_name=function_name,
-                        args=function_args,
-                        result=function_result,
-                        evaluation=_mstar_tool_eval,
-                        session_id=self.session_id or "",
-                    )
-                    if self._mstar_core.should_trigger_evolution():
-                        logger.info("[MSTAR] Triggering adaptive evolution...")
-                        _ev_result = self._mstar_core.run_evolution_cycle()
-                        if self._self_improver and _ev_result:
-                            self._self_improver.on_evolution(
-                                evolution_result=_ev_result,
-                                session_id=self.session_id or "",
-                            )
-                        # Run forgetting mechanism after each evolution
-                        try:
-                            from mstar_core.memory.forgetting import evaluate_all_forgetting
-                            _forget_decisions = evaluate_all_forgetting(self._mstar_core)
-                            _del_count = sum(1 for d in _forget_decisions if d['strategy'] == 'delete')
-                            _arch_count = sum(1 for d in _forget_decisions if d['strategy'] == 'archive')
-                            if _del_count > 0 or _arch_count > 0:
-                                logger.info(
-                                    "[MSTAR] Forgetting: %d to delete, %d to archive (of %d programs)",
-                                    _del_count, _arch_count, len(_forget_decisions)
-                                )
-                        except Exception as _forget_err:
-                            logger.debug("[MSTAR] Forgetting run error: %s", _forget_err)
-                except Exception as _mstar_err:
-                    logger.debug("[MSTAR] Fitness update error: %s", _mstar_err)
-
             if not _execution_blocked:
                 function_result = self._append_guardrail_observation(
                     function_name,
@@ -15040,26 +14936,35 @@ class AIAgent:
                         self.iteration_budget.refund()
                     
                     # Use real token counts from the API response to decide
-# Use real token counts from the API response as a base, then
-                    # ALWAYS add tool schemas and system prompt — MiniMax's
-                    # prompt_tokens excludes the tools= field, and other providers
-                    # may similarly undercount.  Compression triggered on the
-                    # API-reported count alone misses the 20-40K tokens that tools+
-                    # system_prompt add, causing the actual request to exceed the
-                    # context window before compression can fire (#issue).
+                    # compression.  prompt_tokens + completion_tokens is the
+                    # actual context size the provider reported plus the
+                    # assistant turn — a tight lower bound for the next prompt.
+                    # Tool results appended above aren't counted yet, but the
+                    # threshold (default 50%) leaves ample headroom; if tool
+                    # results push past it, the next API call will report the
+                    # real total and trigger compression then.
                     #
-                    # Also include the newly-appended tool results (from this turn)
-                    # which aren't yet reflected in last_prompt_tokens.
+                    # If last_prompt_tokens is 0 (stale after API disconnect
+                    # or provider returned no usage data), fall back to rough
+                    # estimate to avoid missing compression.  Without this,
+                    # a session can grow unbounded after disconnects because
+                    # should_compress(0) never fires.  (#2153)
                     _compressor = self.context_compressor
-                    _base_tokens = _compressor.last_prompt_tokens if _compressor.last_prompt_tokens > 0 else estimate_messages_tokens_rough(messages)
-                    _real_tokens = _base_tokens
-                    # Add tool schemas cost
-                    if self.tools:
-                        _real_tokens += (len(str(self.tools)) + 3) // 4
-                    # Add system prompt cost (use cached value for consistency)
-                    _sys_prompt = getattr(self, "_cached_system_prompt", None) or ""
-                    if _sys_prompt:
-                        _real_tokens += (len(_sys_prompt) + 3) // 4
+                    if _compressor.last_prompt_tokens > 0:
+                        # Only use prompt_tokens — completion/reasoning
+                        # tokens don't consume context window space.
+                        # Thinking models (GLM-5.1, QwQ, DeepSeek R1)
+                        # inflate completion_tokens with reasoning,
+                        # causing premature compression.  (#12026)
+                        _real_tokens = _compressor.last_prompt_tokens
+                    else:
+                        # Include tool schemas — with 50+ tools enabled
+                        # these add 20-30K tokens the messages-only
+                        # estimate misses, which can skip compression
+                        # past the configured threshold (#14695).
+                        _real_tokens = estimate_request_tokens_rough(
+                            messages, tools=self.tools or None
+                        )
 
                     if self.compression_enabled and _compressor.should_compress(_real_tokens):
                         self._safe_print("  ⟳ compacting context…")

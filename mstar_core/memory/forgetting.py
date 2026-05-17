@@ -31,6 +31,7 @@ class ForgetDecision:
     reasons: List[str]
     confidence: float
     timestamp: str
+    fitness_score: float = None  # Bug-1 fix: 添加缺失字段，正确填充fitness_score
 
 
 class ForgettingMechanism:
@@ -64,6 +65,7 @@ class ForgettingMechanism:
             reasons=self._get_decision_reasons(candidate),
             confidence=self._calculate_confidence(candidate),
             timestamp=datetime.now().isoformat(),
+            fitness_score=candidate.fitness_score,  # Bug-1 fix: 正确填充fitness_score
         )
 
     def _calculate_forget_score(self, candidate: ForgetCandidate) -> float:
@@ -105,6 +107,28 @@ class ForgettingMechanism:
         return self._session_metadata.get(session_id, {}).get('compression_ratio', 1.0)
 
     def _determine_strategy(self, forget_score: float, candidate: ForgetCandidate) -> str:
+        # Bug-6 fix: 刚演化的程序（last_evolution_within_threshold）给予保护期不归档
+        import sqlite3
+        db_path = getattr(self.fitness_tracker, 'db_path', None)
+        if db_path:
+            try:
+                conn = sqlite3.connect(db_path, timeout=5)
+                conn.row_factory = sqlite3.Row
+                cur = conn.execute(
+                    "SELECT last_evolution_at FROM programs WHERE program_id = ?",
+                    (candidate.program_id,)
+                )
+                row = cur.fetchone()
+                if row and row['last_evolution_at']:
+                    last_evo = datetime.fromisoformat(row['last_evolution_at'])
+                    days_since_evo = (datetime.now() - last_evo).days
+                    if days_since_evo < 7:  # 演化后7天内不归档
+                        conn.close()
+                        return "keep"
+                conn.close()
+            except Exception:
+                pass  # 静默处理，不阻断决策
+
         if candidate.lineage_depth > 10:
             return "archive"
         if forget_score >= self.archive_threshold:
@@ -210,7 +234,7 @@ class ForgettingMechanism:
 
         conn.close()
 
-# Make decisions and apply lifecycle changes
+        # Make decisions and apply lifecycle changes
         decisions = []
         changes = {"archived": [], "deleted": []}
         for candidate in candidates:
@@ -251,6 +275,7 @@ def evaluate_all_forgetting(mc) -> List[Dict]:
             "confidence": round(d.confidence, 4),
             "reasons": d.reasons,
             "timestamp": d.timestamp,
+            "fitness_score": d.fitness_score,  # Bug-1 fix: 暴露fitness_score字段
         }
         for d in decisions
     ]

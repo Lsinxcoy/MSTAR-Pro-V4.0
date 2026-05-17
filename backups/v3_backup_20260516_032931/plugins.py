@@ -1144,16 +1144,6 @@ class PluginManager:
                 logger.warning("Plugin '%s' has no register() function", manifest.name)
             else:
                 ctx = PluginContext(manifest, self)
-
-                # === MSTAR Pro v4.0: Pre-register hook ===
-                # Warm up mstar_core so tools can use it immediately after registration
-                if manifest.key == "mstar" or manifest.name == "mstar":
-                    try:
-                        import mstar_core as _mstar
-                        logger.info("[MSTAR] Plugin pre-register: core already available")
-                    except ImportError:
-                        logger.warning("[MSTAR] Plugin 'mstar' registered but mstar_core not found in sys.path")
-
                 register_fn(ctx)
                 loaded.tools_registered = [
                     t for t in self._plugin_tool_names
