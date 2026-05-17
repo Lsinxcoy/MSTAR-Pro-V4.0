@@ -355,12 +355,14 @@ class LLMJudgePredictor(ToolFitnessPredictor):
 
 答案是：P(提升) = {prob}（填入0.0~1.0之间的小数，仅输出数字）"""
 
-    def __init__(self, llm_client):
+    def __init__(self, llm_client, model: str = "MiniMax-M2.7"):
         """
         Args:
             llm_client: LLM 客户端，需支持 chat.completions.create 接口
+            model: 模型名称，默认 MiniMax-M2.7（可覆盖）
         """
         self.llm = llm_client
+        self.model = model
 
     def predict_mutation_benefit(self, program, strategy: str) -> float:
         """调用 LLM 判断变异收益概率"""
@@ -384,7 +386,7 @@ class LLMJudgePredictor(ToolFitnessPredictor):
 
         try:
             response = self.llm.chat.completions.create(
-                model="MiniMax-M2.7",
+                model=self.model,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=20,
                 temperature=0.0,  # 确定性输出
@@ -567,18 +569,79 @@ class TrainedPredictor(ToolFitnessPredictor):
 
     def train_model(self):
         """
-        基于已有记录训练模型（待实现）
-        需要 fitness_snapshots 表有足够多的变异历史数据
+        基于已有记录训练 LogisticRegression 模型。
+
+        特征向量: [fitness_score, lineage_depth/N, strategy_encoding, trend, volatility]
+        标签:     improved (delta > 0 ? 1 : 0)
+
+        需要 >= 20 条记录才训练。训练后 self.model 可用，
+        predict_mutation_benefit 自动切换到模型预测。
         """
         if len(self._training_records) < 20:
             logger.info(f"[TrainedPredictor] Not enough records to train: {len(self._training_records)} < 20")
             return
 
-        # TODO: 实现训练逻辑
-        # 1. 构建特征矩阵和标签向量
-        # 2. 训练 LogisticRegression 或 XGBoost
-        # 3. self.model = trained_model
-        logger.info(f"[TrainedPredictor] train_model() not yet implemented, {len(self._training_records)} records available")
+        try:
+            import numpy as np
+            from sklearn.linear_model import LogisticRegression
+        except ImportError:
+            logger.warning("[TrainedPredictor] sklearn not available, cannot train model")
+            return
+
+        # ── 构建特征矩阵 ────────────────────────────────────
+        X_rows = []
+        y_rows = []
+        for rec in self._training_records:
+            pid = rec.get('program_id')
+            strategy = rec.get('strategy', 'random')
+
+            # 从 DB 查询程序当前状态（fitness, lineage_depth）
+            fitness = 0.5
+            depth = 0
+            if pid and self.fitness_tracker:
+                try:
+                    import sqlite3
+                    conn = sqlite3.connect(self.fitness_tracker.db_path, timeout=10)
+                    row = conn.execute(
+                        "SELECT fitness_score, lineage_depth FROM programs WHERE program_id = ?",
+                        (pid,)
+                    ).fetchone()
+                    conn.close()
+                    if row:
+                        fitness = row[0] or 0.5
+                        depth = row[1] or 0
+                except Exception:
+                    pass
+
+            trend = self._get_trend(pid) if pid else 0.0
+            volatility = self._get_volatility(pid) if pid else 0.0
+
+            features = np.array([
+                fitness,
+                depth / 10.0,
+                self._strategy_encoding.get(strategy, 0.5),
+                trend,
+                volatility,
+            ], dtype=np.float32)
+            X_rows.append(features)
+            y_rows.append(1 if rec.get('improved') else 0)
+
+        X = np.array(X_rows, dtype=np.float32)
+        y = np.array(y_rows, dtype=np.int32)
+
+        # ── 训练 ───────────────────────────────────────────
+        model = LogisticRegression(
+            max_iter=200,
+            class_weight='balanced',  # 处理类别不平衡
+            random_state=42,
+        )
+        model.fit(X, y)
+
+        self.model = model
+        logger.info(
+            f"[TrainedPredictor] Model trained on {len(self._training_records)} records. "
+            f"Accuracy: {model.score(X, y):.3f}"
+        )
 
 
 # ─────────────────────────────────────────────────────────────

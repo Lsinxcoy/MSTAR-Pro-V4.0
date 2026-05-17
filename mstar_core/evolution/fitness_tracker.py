@@ -124,11 +124,14 @@ class FitnessTracker:
                 parent_id TEXT,
                 created_at TEXT,
                 last_evolution_at TEXT,
-                fitness_score REAL,
+fitness_score REAL,
                 fitness_history TEXT,
                 explanation_cache TEXT,
-                lifecycle_status TEXT DEFAULT 'active'
-)
+                lifecycle_status TEXT DEFAULT 'active',
+                episodes INTEGER DEFAULT 0,
+                failure_type TEXT,
+                last_failure_at TEXT
+            )
         """)
 
         conn.execute("""
@@ -224,8 +227,10 @@ class FitnessTracker:
             conn = sqlite3.connect(self.db_path, timeout=30)
             conn.execute("""
                 INSERT OR REPLACE INTO programs
-                (program_id, name, parent_id, lineage_depth, fitness_score, fitness_history, explanation_cache, created_at, last_evolution_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (program_id, name, parent_id, lineage_depth, fitness_score, fitness_history,
+                 explanation_cache, created_at, last_evolution_at, lifecycle_status,
+                 episodes, failure_type, last_failure_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 program.program_id,
                 program.name,
@@ -236,6 +241,10 @@ class FitnessTracker:
                 str(program.explanation_cache),
                 program.created_at,
                 getattr(program, 'last_evolution_at', None) or datetime.now().isoformat(),
+                getattr(program, 'lifecycle_status', 'active'),
+                len(program.episodes),
+                getattr(program, 'failure_type', None),
+                getattr(program, 'last_failure_at', None),
             ))
             conn.commit()
             conn.close()

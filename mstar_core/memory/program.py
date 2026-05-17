@@ -22,6 +22,9 @@ class MemoryProgram:
     fitness_history: List[float] = field(default_factory=list)
     explanation_cache: Dict[str, str] = field(default_factory=dict)
     episodes: List[Dict] = field(default_factory=list)
+    failure_type: Optional[str] = None
+    last_failure_at: Optional[str] = None
+    lifecycle_status: str = 'active'
 
     def update_fitness(self, episode: Dict, dimensions: Optional[Dict[str, float]] = None):
         self.episodes.append(episode)

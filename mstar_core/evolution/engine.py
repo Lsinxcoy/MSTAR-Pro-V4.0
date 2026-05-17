@@ -248,6 +248,13 @@ class EvolutionEngine:
         failure_analysis = self.reflector.analyze_failures(program)
         strategy = strategy or failure_analysis.get('recommended_strategy', 'random')
 
+        # ── Lim-3: 从 failure_analysis 提取 failure_type 并写回 program ──
+        failure_type_detected = failure_analysis.get('failure_type', 'no_data')
+        if hasattr(program, 'failure_type'):
+            program.failure_type = failure_type_detected
+            from datetime import datetime
+            program.last_failure_at = datetime.now().isoformat()
+
         # 记录变异前状态（Bug-4: 用于 rollback 熔断）
         import copy
         state_before = {
@@ -255,6 +262,14 @@ class EvolutionEngine:
             'lineage_depth': getattr(program, 'lineage_depth', 0),
             'parent_id': getattr(program, 'parent_id', None),
         }
+
+        # Bug-4 fix: 在变异前用预测器获取 predicted_prob（Mutator 不设置此字段）
+        predicted_prob = 0.5
+        if hasattr(self, 'predictor') and self.predictor:
+            try:
+                predicted_prob = self.predictor.predict_mutation_benefit(program, strategy)
+            except Exception:
+                predicted_prob = 0.5
 
         mutation_result = self.mutator.mutate(program, strategy=strategy)
 
@@ -270,11 +285,11 @@ class EvolutionEngine:
             if getattr(program, 'parent_id', None) is None:
                 program.parent_id = program.program_id
 
-            # ── Bug-4: 熔断机制 - 预测概率 > 0.5 但 fitness 反而下降则 rollback ──
-            predicted_prob = mutation_result.__dict__.get('predicted_prob', 0.5)
             fitness_after = mutation_result.new_fitness
             fitness_delta = fitness_after - fitness_before
 
+            # ── Bug-4: 熔断机制 - 预测概率 > 0.5 但 fitness 反而下降则 rollback ──
+            # predicted_prob 来自变异前的预测器输出（已在上方计算）
             if predicted_prob > 0.5 and fitness_delta < 0:
                 logger.warning(
                     f"[Bug-4 Rollback] prog={program.program_id} "
@@ -303,7 +318,8 @@ class EvolutionEngine:
             'fitness_before': fitness_before,
             'fitness_after': fitness_after,
             'fitness_delta': fitness_delta,
-            'rollback': fitness_delta == 0 and mutation_result.__dict__.get('predicted_prob', 0) > 0.5,
+            'predicted_prob': predicted_prob,   # Bug-4 fix: 传递预测概率供 record_outcome 使用
+            'rollback': fitness_delta == 0 and predicted_prob > 0.5,
         }
 
     def _explain_evolution_decision(self, program, result: Dict, predicted_prob: float = None) -> str:
